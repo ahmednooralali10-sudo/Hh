@@ -60,6 +60,8 @@ user_client = TelegramClient(
 )
 
 call_py = PyTgCalls(user_client) if VOICE_CALLS_AVAILABLE else None
+_call_py_started = False
+_call_py_lock = asyncio.Lock()
 
 # ==========================================
 # حالة التشغيل والذاكرة المؤقتة
@@ -133,6 +135,19 @@ def format_shortcuts_list() -> str:
     return "\n".join(lines)
 
 
+async def ensure_call_py_ready() -> None:
+    global call_py, _call_py_started
+    if not VOICE_CALLS_AVAILABLE or PyTgCalls is None:
+        raise RuntimeError("مكتبة py-tgcalls غير مثبتة على السيرفر.")
+    async with _call_py_lock:
+        if call_py is None:
+            call_py = PyTgCalls(user_client)
+            _call_py_started = False
+        if not _call_py_started:
+            await call_py.start()
+            _call_py_started = True
+
+
 def resolve_local_or_url_track(query: str) -> dict:
     q = (query or "").strip()
     if not q or q.lower() in {"mahdi", "mahdi.m4a", "local", "file"}:
@@ -172,15 +187,27 @@ def resolve_local_or_url_track(query: str) -> dict:
 
 
 async def start_voice_stream(chat_id: int, track: dict) -> None:
-    global VOICE_PLAYS_COUNT
-    if not (VOICE_CALLS_AVAILABLE and call_py):
-        raise RuntimeError(
-            "مكتبات البث الصوتي غير مكتملة على السيرفر. تأكد من تثبيت py-tgcalls و ffmpeg."
+    global VOICE_PLAYS_COUNT, call_py, _call_py_started
+    await ensure_call_py_ready()
+    try:
+        await call_py.play(
+            chat_id,
+            MediaStream(track["stream_url"]),
         )
-    await call_py.play(
-        chat_id,
-        MediaStream(track["stream_url"]),
-    )
+    except RuntimeError as e:
+        if "different loop" in str(e) or "attached to a different loop" in str(e):
+            async with _call_py_lock:
+                call_py = PyTgCalls(user_client)
+                _call_py_started = False
+                await call_py.start()
+                _call_py_started = True
+            await call_py.play(
+                chat_id,
+                MediaStream(track["stream_url"]),
+            )
+        else:
+            raise
+
     ACTIVE_CALLS[chat_id] = {
         "title": track["title"],
         "duration": track["duration"],
@@ -243,7 +270,7 @@ async def vioc_play_cmd(event):
 
     query = (event.pattern_match.group(1) or "").strip()
 
-    if not (VOICE_CALLS_AVAILABLE and call_py):
+    if not VOICE_CALLS_AVAILABLE:
         await event.edit(
             "❌ **تجهيز السيرفر مطلوب لتشغيل المكالمات الصوتية:**\n"
             "تأكد من تثبيت `py-tgcalls` و `ffmpeg` على السيرفر."
@@ -997,12 +1024,11 @@ async def daily_task():
 
 async def start_services():
     await user_client.start()
-    if call_py:
-        try:
-            await call_py.start()
-            print("تم تفعيل محرك المكالمات الصوتية PyTgCalls بنجاح!")
-        except Exception as e:
-            print(f"تنبيه: تعذر تشغيل PyTgCalls: {e}")
+    try:
+        await ensure_call_py_ready()
+        print("تم تفعيل محرك المكالمات الصوتية PyTgCalls على نفس الـ loop بنجاح!")
+    except Exception as e:
+        print(f"تنبيه: تعذر تشغيل PyTgCalls عند الإقلاع: {e}")
     print("تم تشغيل اليوزر بوت بنجاح تام عبر SESSION_STRING!")
     asyncio.create_task(daily_task())
 
