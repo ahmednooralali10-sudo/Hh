@@ -172,7 +172,7 @@ async def mahdi_menu(event):
 # ==========================================
 # مجموعة الاختصارات الذكية (/sa)
 # ==========================================
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/sa(?:\s+(\S+)(?:\s+(.+))?)?$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/sa(?:\s+(\S+)(?:\s+(.+))?)?$"))
 async def sa_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -309,7 +309,7 @@ async def clear_history_cmd(event):
     await event.edit("🧹 تم مسح سجل النتائج المؤقت بنجاح.")
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/sched(?:\s+(on|off))?$", flags=re.IGNORECASE))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?i)^/sched(?:\s+(on|off))?$"))
 async def sched_cmd(event):
     global DAILY_SCHED_ENABLED, COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -353,7 +353,7 @@ async def afk_off(event):
     await event.edit("⏸️ تم **إيقاف** الرد التلقائي (AFK).")
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/afkmsg\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/afkmsg\s+(.+)$"))
 async def set_afk_msg(event):
     global AFK_TEXT, COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -379,14 +379,14 @@ async def afk_count_cmd(event):
 # ==========================================
 # مجموعة الرسائل والتحرير
 # ==========================================
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/say\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/say\s+(.+)$"))
 async def say_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
     await event.edit(event.pattern_match.group(1))
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/echo\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/echo\s+(.+)$"))
 async def echo_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -408,7 +408,7 @@ async def del_cmd(event):
         await event.edit(f"❌ تعذر حذف الرسالة: {e}")
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/edit\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/edit\s+(.+)$"))
 async def edit_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -465,7 +465,7 @@ async def copy_cmd(event):
 # ==========================================
 # مجموعة الملاحظات والأدوات والحالة
 # ==========================================
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/note\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/note\s+(.+)$"))
 async def add_note_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -611,7 +611,7 @@ async def calc_cmd(event):
     await event.edit(safe_calc(event.pattern_match.group(1)))
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/rev\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/rev\s+(.+)$"))
 async def rev_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -619,21 +619,21 @@ async def rev_cmd(event):
     await event.edit(f"🔁 **النص معكوساً:**\n{txt[::-1]}")
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/upper\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/upper\s+(.+)$"))
 async def upper_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
     await event.edit(event.pattern_match.group(1).upper())
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/lower\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/lower\s+(.+)$"))
 async def lower_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
     await event.edit(event.pattern_match.group(1).lower())
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/len\s+(.+)$", flags=re.DOTALL))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/len\s+(.+)$"))
 async def len_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
