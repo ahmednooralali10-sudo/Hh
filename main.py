@@ -2,7 +2,6 @@ import os
 import re
 import time
 import uuid
-import math
 import random
 import asyncio
 from urllib.parse import quote
@@ -38,6 +37,7 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 TARGET_CHAT = os.environ.get("TARGET_CHAT", "")
 MY_TELEGRAM_ID = int(os.environ.get("MY_TELEGRAM_ID", 0))
 STICKER_ID = os.environ.get("STICKER_ID", "")
+YT_COOKIES = os.environ.get("YT_COOKIES", "")
 
 DEFAULT_UID = "11877711994"
 DEFAULT_AFK_MSG = "أهلاً يا حلو 🤍\nأنا الحين ماني متصل، اترك رسالتك وإن شاء الله برد عليك ياقلبي 🫀"
@@ -46,13 +46,22 @@ KSA_TZ = timezone(timedelta(hours=3))
 if TARGET_CHAT and TARGET_CHAT.lstrip("-").isdigit():
     TARGET_CHAT = int(TARGET_CHAT)
 
+# حفظ الكوكيز في ملف مؤقت إذا تم توفيره في متغيرات Render
+COOKIES_FILE_PATH = "/tmp/youtube_cookies.txt"
+if YT_COOKIES.strip():
+    try:
+        with open(COOKIES_FILE_PATH, "w", encoding="utf-8") as cf:
+            cf.write(YT_COOKIES.strip())
+    except Exception as e:
+        print(f"تعذر كتابة ملف الكوكيز: {e}")
+
 app = FastAPI()
 
 
 @app.get("/")
 def home():
     return {
-        "status": "Mahdi Userbot v5 (Voice + AI + 52 Features) is running!",
+        "status": "Mahdi Userbot v6 (Voice + AI + 53 Features) is running!",
         "voice_calls_ready": VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE,
     }
 
@@ -141,28 +150,50 @@ def format_shortcuts_list() -> str:
 # دوال استخراج الصوت من يوتيوب وتشغيله في المكالمة
 # ==========================================
 def _extract_youtube_audio_sync(query_or_url: str) -> dict:
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "default_search": "ytsearch1",
-        "extract_flat": False,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query_or_url, download=False)
-        if "entries" in info and info["entries"]:
-            info = info["entries"][0]
-        stream_url = info.get("url")
-        title = info.get("title", "مقطع يوتيوب")
-        duration = info.get("duration") or 0
-        webpage_url = info.get("webpage_url", query_or_url)
-        return {
-            "stream_url": stream_url,
-            "title": title,
-            "duration": duration,
-            "webpage_url": webpage_url,
+    # محاولة متعددة العملاء لتجاوز قيود YouTube player response على السيرفرات السحابية
+    client_profiles = [
+        ["android", "web"],
+        ["ios", "mweb"],
+        ["tv_embedded", "web"],
+    ]
+    last_err = None
+
+    for clients in client_profiles:
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "default_search": "ytsearch1",
+            "extract_flat": False,
+            "geo_bypass": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": clients,
+                    "player_skip": ["webpage", "configs"],
+                }
+            },
         }
+        if os.path.exists(COOKIES_FILE_PATH):
+            ydl_opts["cookiefile"] = COOKIES_FILE_PATH
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(query_or_url, download=False)
+                if "entries" in info and info["entries"]:
+                    info = info["entries"][0]
+                stream_url = info.get("url")
+                if stream_url:
+                    return {
+                        "stream_url": stream_url,
+                        "title": info.get("title", "مقطع يوتيوب"),
+                        "duration": info.get("duration") or 0,
+                        "webpage_url": info.get("webpage_url", query_or_url),
+                    }
+        except Exception as e:
+            last_err = e
+
+    raise RuntimeError(f"فشل استخراج الصوت من يوتيوب: {last_err}")
 
 
 async def extract_youtube_audio(query_or_url: str) -> dict:
@@ -250,9 +281,9 @@ async def execute_like_and_fetch_result(uid: str = DEFAULT_UID) -> str:
 
 
 # ==========================================
-# أوامر المكالمات الصوتية وبث يوتيوب في القروب (/vioc)
+# أوامر المكالمات الصوتية وبث يوتيوب في القروب (/vioc و /voic)
 # ==========================================
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/vioc(?:\s+(.+))?$"))
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/(?:vioc|voic)(?:\s+(.+))?$"))
 async def vioc_play_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
@@ -265,7 +296,7 @@ async def vioc_play_cmd(event):
     if not query:
         await event.edit(
             "🎵 **طريقة الاستخدام:**\n"
-            "• `/vioc رابط فيديو يوتيوب` — تشغيل صوت الفيديو مباشرة في مكالمة القروب\n"
+            "• `/vioc رابط فيديو يوتيوب` (أو `/voic`) — تشغيل صوت الفيديو مباشرة في مكالمة القروب\n"
             "• `/vioc اسم المقطع` — بحث تلقائي في يوتيوب وتشغيل أول نتيجة\n"
             "• `/vqueue <رابط>` — إضافة مقطع لقائمة الانتظار\n"
             "• `/vskip` — تخطي للمقطع التالي | `/vpause` — إيقاف مؤقت\n"
@@ -276,7 +307,7 @@ async def vioc_play_cmd(event):
     if not (VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE and call_py):
         await event.edit(
             "❌ **تجهيز السيرفر مطلوب لتشغيل المكالمات الصوتية:**\n"
-            "تأكد من تثبيت `py-tgcalls` و `yt-dlp` و `ffmpeg` على السيرفر (راجع ملف الشرح المرفق)."
+            "تأكد من تثبيت `py-tgcalls` و `yt-dlp` و `ffmpeg` على السيرفر."
         )
         return
 
@@ -297,7 +328,7 @@ async def vioc_play_cmd(event):
     except Exception as e:
         await status.edit(
             f"❌ **تعذر تشغيل الصوت في المكالمة:**\n`{e}`\n\n"
-            "💡 تأكد أن المحادثة الصوتية (Voice Chat) مفتوحة في القروب وأن لديك صلاحية التحدث."
+            "💡 إذا استمر حظر يوتيوب لسيرفر Render، أضف متغير `YT_COOKIES` في Render أو تأكد أن المحادثة الصوتية مفتوحة في القروب."
         )
 
 
@@ -459,9 +490,9 @@ async def mahdi_menu(event):
     ai_state = "مفعل ✅" if AI_ENABLED else "متوقف ⏸️"
     voice_state = "جاهز ✅" if (VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE) else "يحتاج ffmpeg/pytgcalls ⚠️"
     menu_text = (
-        "👑 **قائمة أوامر يوزر بوت مهدي (52 ميزة):**\n\n"
+        "👑 **قائمة أوامر يوزر بوت مهدي (53 ميزة):**\n\n"
         "**🎵 المكالمات الصوتية وبث يوتيوب:**\n"
-        "• `/vioc <رابط يوتيوب أو اسم>` — دخول مكالمة القروب وتشغيل الصوت\n"
+        "• `/vioc` أو `/voic <رابط يوتيوب أو اسم>` — دخول مكالمة القروب وتشغيل الصوت\n"
         "• `/vqueue <رابط>` — إضافة مقطع لقائمة الانتظار | `/vskip` — تخطي\n"
         "• `/vpause` — إيقاف مؤقت | `/vresume` — استئناف | `/vstop` — خروج\n"
         "• `/vnow` — عرض المقطع الشغال حالياً\n\n"
