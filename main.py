@@ -21,13 +21,6 @@ except ImportError:
     MediaStream = None
     VOICE_CALLS_AVAILABLE = False
 
-try:
-    import yt_dlp
-    YTDLP_AVAILABLE = True
-except ImportError:
-    yt_dlp = None
-    YTDLP_AVAILABLE = False
-
 # ==========================================
 # قراءة متغيرات البيئة من Render
 # ==========================================
@@ -37,23 +30,16 @@ SESSION_STRING = os.environ.get("SESSION_STRING", "")
 TARGET_CHAT = os.environ.get("TARGET_CHAT", "")
 MY_TELEGRAM_ID = int(os.environ.get("MY_TELEGRAM_ID", 0))
 STICKER_ID = os.environ.get("STICKER_ID", "")
-YT_COOKIES = os.environ.get("YT_COOKIES", "")
 
 DEFAULT_UID = "11877711994"
 DEFAULT_AFK_MSG = "أهلاً يا حلو 🤍\nأنا الحين ماني متصل، اترك رسالتك وإن شاء الله برد عليك ياقلبي 🫀"
 KSA_TZ = timezone(timedelta(hours=3))
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_AUDIO_FILE = os.path.join(BASE_DIR, "mahdi.m4a")
+
 if TARGET_CHAT and TARGET_CHAT.lstrip("-").isdigit():
     TARGET_CHAT = int(TARGET_CHAT)
-
-# حفظ الكوكيز في ملف مؤقت إذا تم توفيره في متغيرات Render
-COOKIES_FILE_PATH = "/tmp/youtube_cookies.txt"
-if YT_COOKIES.strip():
-    try:
-        with open(COOKIES_FILE_PATH, "w", encoding="utf-8") as cf:
-            cf.write(YT_COOKIES.strip())
-    except Exception as e:
-        print(f"تعذر كتابة ملف الكوكيز: {e}")
 
 app = FastAPI()
 
@@ -61,8 +47,9 @@ app = FastAPI()
 @app.get("/")
 def home():
     return {
-        "status": "Mahdi Userbot v6 (Voice + AI + 53 Features) is running!",
-        "voice_calls_ready": VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE,
+        "status": "Mahdi Userbot (Local mahdi.m4a + Voice + AI) is running!",
+        "voice_calls_ready": VOICE_CALLS_AVAILABLE,
+        "local_audio_exists": os.path.exists(LOCAL_AUDIO_FILE),
     }
 
 
@@ -146,85 +133,53 @@ def format_shortcuts_list() -> str:
     return "\n".join(lines)
 
 
-# ==========================================
-# دوال استخراج الصوت من يوتيوب وتشغيله في المكالمة
-# ==========================================
-def _extract_youtube_audio_sync(query_or_url: str) -> dict:
-    # محاولة متعددة العملاء لتجاوز قيود YouTube player response على السيرفرات السحابية
-    client_profiles = [
-        ["android", "web"],
-        ["ios", "mweb"],
-        ["tv_embedded", "web"],
-    ]
-    last_err = None
-
-    for clients in client_profiles:
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "default_search": "ytsearch1",
-            "extract_flat": False,
-            "geo_bypass": True,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": clients,
-                    "player_skip": ["webpage", "configs"],
-                }
-            },
+def resolve_local_or_url_track(query: str) -> dict:
+    q = (query or "").strip()
+    if not q or q.lower() in {"mahdi", "mahdi.m4a", "local", "file"}:
+        if not os.path.exists(LOCAL_AUDIO_FILE):
+            raise FileNotFoundError(
+                "لم يتم العثور على الملف mahdi.m4a داخل مجلد المشروع. ارفع mahdi.m4a بجانب main.py في GitHub."
+            )
+        return {
+            "stream_url": LOCAL_AUDIO_FILE,
+            "title": "mahdi.m4a (ملف صوتي محلي)",
+            "duration": 0,
+            "webpage_url": "ملف محلي داخل المجلد",
         }
-        if os.path.exists(COOKIES_FILE_PATH):
-            ydl_opts["cookiefile"] = COOKIES_FILE_PATH
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(query_or_url, download=False)
-                if "entries" in info and info["entries"]:
-                    info = info["entries"][0]
-                stream_url = info.get("url")
-                if stream_url:
-                    return {
-                        "stream_url": stream_url,
-                        "title": info.get("title", "مقطع يوتيوب"),
-                        "duration": info.get("duration") or 0,
-                        "webpage_url": info.get("webpage_url", query_or_url),
-                    }
-        except Exception as e:
-            last_err = e
+    candidate_path = os.path.join(BASE_DIR, q)
+    if os.path.isfile(candidate_path):
+        return {
+            "stream_url": candidate_path,
+            "title": f"{os.path.basename(candidate_path)} (ملف صوتي محلي)",
+            "duration": 0,
+            "webpage_url": "ملف محلي داخل المجلد",
+        }
 
-    raise RuntimeError(f"فشل استخراج الصوت من يوتيوب: {last_err}")
+    if re.match(r"^https?://", q, re.IGNORECASE) and re.search(
+        r"\.(mp3|m4a|ogg|wav|flac|aac|opus)(\?.*)?$", q, re.IGNORECASE
+    ):
+        return {
+            "stream_url": q,
+            "title": "ملف صوتي مباشر من الرابط",
+            "duration": 0,
+            "webpage_url": q,
+        }
 
-
-async def extract_youtube_audio(query_or_url: str) -> dict:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _extract_youtube_audio_sync, query_or_url)
-
-
-def format_duration(seconds: int) -> str:
-    if not seconds:
-        return "غير محدد"
-    mins, secs = divmod(int(seconds), 60)
-    hours, mins = divmod(mins, 60)
-    if hours:
-        return f"{hours}:{mins:02d}:{secs:02d}"
-    return f"{mins}:{secs:02d}"
+    raise RuntimeError(
+        "أرسل `/vioc` أو `/vioc mahdi.m4a` لتشغيل ملفك المحلي داخل المجلد، أو أرسل رابط ملف صوتي مباشر (.mp3 / .m4a / .ogg)."
+    )
 
 
 async def start_voice_stream(chat_id: int, track: dict) -> None:
     global VOICE_PLAYS_COUNT
-    if not (VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE and call_py):
+    if not (VOICE_CALLS_AVAILABLE and call_py):
         raise RuntimeError(
-            "مكتبات البث الصوتي غير مكتملة على السيرفر. تأكد من تثبيت py-tgcalls و yt-dlp و ffmpeg."
+            "مكتبات البث الصوتي غير مكتملة على السيرفر. تأكد من تثبيت py-tgcalls و ffmpeg."
         )
     await call_py.play(
         chat_id,
-        MediaStream(
-            track["stream_url"],
-            audio_parameters=MediaStream.AudioQuality.HIGH if hasattr(MediaStream, "AudioQuality") else None,
-        )
-        if not hasattr(MediaStream, "from_quality")
-        else MediaStream(track["stream_url"]),
+        MediaStream(track["stream_url"]),
     )
     ACTIVE_CALLS[chat_id] = {
         "title": track["title"],
@@ -236,9 +191,6 @@ async def start_voice_stream(chat_id: int, track: dict) -> None:
     VOICE_PLAYS_COUNT += 1
 
 
-# ==========================================
-# دالة الذكاء الاصطناعي المجاني
-# ==========================================
 async def ask_free_ai(prompt: str) -> str:
     url = f"https://text.pollinations.ai/{quote(prompt)}"
     try:
@@ -255,9 +207,6 @@ async def ask_free_ai(prompt: str) -> str:
         return f"❌ تعذر الاتصال بالذكاء الاصطناعي حالياً: {e}"
 
 
-# ==========================================
-# دالة إرسال اللايك وانتظار النتيجة من القروب
-# ==========================================
 async def execute_like_and_fetch_result(uid: str = DEFAULT_UID) -> str:
     global LIKE_RUNS_COUNT
     LIKE_RUNS_COUNT += 1
@@ -281,7 +230,7 @@ async def execute_like_and_fetch_result(uid: str = DEFAULT_UID) -> str:
 
 
 # ==========================================
-# أوامر المكالمات الصوتية وبث يوتيوب في القروب (/vioc و /voic)
+# أوامر المكالمات الصوتية وبث الملفات (/vioc و /voic)
 # ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/(?:vioc|voic)(?:\s+(.+))?$"))
 async def vioc_play_cmd(event):
@@ -293,42 +242,27 @@ async def vioc_play_cmd(event):
         return
 
     query = (event.pattern_match.group(1) or "").strip()
-    if not query:
-        await event.edit(
-            "🎵 **طريقة الاستخدام:**\n"
-            "• `/vioc رابط فيديو يوتيوب` (أو `/voic`) — تشغيل صوت الفيديو مباشرة في مكالمة القروب\n"
-            "• `/vioc اسم المقطع` — بحث تلقائي في يوتيوب وتشغيل أول نتيجة\n"
-            "• `/vqueue <رابط>` — إضافة مقطع لقائمة الانتظار\n"
-            "• `/vskip` — تخطي للمقطع التالي | `/vpause` — إيقاف مؤقت\n"
-            "• `/vresume` — استئناف | `/vstop` — مغادرة المكالمة | `/vnow` — ما يُعرض الآن"
-        )
-        return
 
-    if not (VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE and call_py):
+    if not (VOICE_CALLS_AVAILABLE and call_py):
         await event.edit(
             "❌ **تجهيز السيرفر مطلوب لتشغيل المكالمات الصوتية:**\n"
-            "تأكد من تثبيت `py-tgcalls` و `yt-dlp` و `ffmpeg` على السيرفر."
+            "تأكد من تثبيت `py-tgcalls` و `ffmpeg` على السيرفر."
         )
         return
 
-    status = await event.edit("🔎 جاري جلب الصوت من يوتيوب والانضمام لمكالمة القروب...")
+    status = await event.edit("🔊 جاري تجهيز ملف `mahdi.m4a` والانضمام لمكالمة القروب...")
     try:
-        track = await extract_youtube_audio(query)
-        if not track.get("stream_url"):
-            await status.edit("❌ تعذر استخراج رابط الصوت من هذا الفيديو.")
-            return
-
+        track = resolve_local_or_url_track(query)
         await start_voice_stream(event.chat_id, track)
         await status.edit(
-            f"🔊 **تم الدخول للمكالمة وبدأ البث الصوتي!**\n\n"
-            f"🎬 **العنوان:** {track['title']}\n"
-            f"⏱️ **المدة:** `{format_duration(track['duration'])}`\n"
-            f"🔗 **الرابط:** {track['webpage_url']}"
+            f"🔊 **تم الدخول للمكالمة وبدأ تشغيل الصوت!**\n\n"
+            f"🎵 **الملف / المقطع:** {track['title']}\n"
+            f"📍 **المصدر:** {track['webpage_url']}"
         )
     except Exception as e:
         await status.edit(
             f"❌ **تعذر تشغيل الصوت في المكالمة:**\n`{e}`\n\n"
-            "💡 إذا استمر حظر يوتيوب لسيرفر Render، أضف متغير `YT_COOKIES` في Render أو تأكد أن المحادثة الصوتية مفتوحة في القروب."
+            "💡 تأكد من وجود `mahdi.m4a` داخل مجلد المشروع وأن المحادثة الصوتية مفتوحة في القروب."
         )
 
 
@@ -339,16 +273,16 @@ async def vqueue_cmd(event):
     if event.is_private:
         await event.edit("⚠️ يعمل هذا الأمر داخل القروبات فقط.")
         return
-    if not (VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE):
+    if not VOICE_CALLS_AVAILABLE:
         await event.edit("❌ مكتبات الصوت غير مثبتة على السيرفر.")
         return
     query = event.pattern_match.group(1).strip()
     msg = await event.edit("⏳ جاري إضافة المقطع لقائمة الانتظار...")
     try:
-        track = await extract_youtube_audio(query)
+        track = resolve_local_or_url_track(query)
         VOICE_QUEUES.setdefault(event.chat_id, []).append(track)
         pos = len(VOICE_QUEUES[event.chat_id])
-        await msg.edit(f"➕ **تمت الإضافة لقائمة الانتظار (الترتيب #{pos}):**\n🎬 {track['title']}")
+        await msg.edit(f"➕ **تمت الإضافة لقائمة الانتظار (الترتيب #{pos}):**\n🎵 {track['title']}")
     except Exception as e:
         await msg.edit(f"❌ خطأ أثناء الإضافة: `{e}`")
 
@@ -430,16 +364,12 @@ async def vnow_cmd(event):
     q_len = len(VOICE_QUEUES.get(event.chat_id, []))
     await event.edit(
         f"🎧 **حالة البث الصوتي في القروب:**\n"
-        f"• **المقطع:** {current['title']}\n"
-        f"• **المدة:** `{format_duration(current['duration'])}`\n"
+        f"• **الملف / المقطع:** {current['title']}\n"
         f"• **الحالة:** {state}\n"
         f"• **في الانتظار:** `{q_len}` مقاطع"
     )
 
 
-# ==========================================
-# أمر الذكاء الاصطناعي للجميع (/ai)
-# ==========================================
 @user_client.on(events.NewMessage(pattern=r"(?s)^/ai(?:\s+(.+))?$"))
 async def ai_cmd(event):
     global AI_REQUESTS_COUNT, AI_ENABLED
@@ -477,9 +407,6 @@ async def ai_cmd(event):
         await thinking.edit(f"🤖 **الرد:**\n\n{answer}")
 
 
-# ==========================================
-# القائمة الرئيسية الشاملة (/mahdi)
-# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/mahdi$"))
 async def mahdi_menu(event):
     global COMMANDS_USED_COUNT
@@ -488,14 +415,14 @@ async def mahdi_menu(event):
     sched_state = "مفعل ✅" if DAILY_SCHED_ENABLED else "متوقف ⏸️"
     sa_state = "مفعل ✅" if SHORTCUTS_ENABLED else "متوقف ⏸️"
     ai_state = "مفعل ✅" if AI_ENABLED else "متوقف ⏸️"
-    voice_state = "جاهز ✅" if (VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE) else "يحتاج ffmpeg/pytgcalls ⚠️"
+    voice_state = "جاهز ✅" if VOICE_CALLS_AVAILABLE else "يحتاج ffmpeg/pytgcalls ⚠️"
+    file_state = "موجود ✅" if os.path.exists(LOCAL_AUDIO_FILE) else "غير مرفوع ⚠️"
     menu_text = (
         "👑 **قائمة أوامر يوزر بوت مهدي (53 ميزة):**\n\n"
-        "**🎵 المكالمات الصوتية وبث يوتيوب:**\n"
-        "• `/vioc` أو `/voic <رابط يوتيوب أو اسم>` — دخول مكالمة القروب وتشغيل الصوت\n"
-        "• `/vqueue <رابط>` — إضافة مقطع لقائمة الانتظار | `/vskip` — تخطي\n"
-        "• `/vpause` — إيقاف مؤقت | `/vresume` — استئناف | `/vstop` — خروج\n"
-        "• `/vnow` — عرض المقطع الشغال حالياً\n\n"
+        "**🎵 المكالمات الصوتية (ملف mahdi.m4a):**\n"
+        "• `/vioc` أو `/voic` — دخول مكالمة القروب وتشغيل `mahdi.m4a` مباشرة\n"
+        "• `/vioc mahdi.m4a` أو `/vioc <رابط صوت مباشر>`\n"
+        "• `/vqueue <ملف/رابط>` | `/vskip` | `/vpause` | `/vresume` | `/vstop` | `/vnow`\n\n"
         "**🤖 الذكاء الاصطناعي (متاح للجميع):**\n"
         "• `/ai <النص>` — سؤال الذكاء الاصطناعي المجاني\n"
         "• `/ai on` و `/ai off` — تشغيل أو إيقاف `/ai` (لك فقط)\n\n"
@@ -516,14 +443,11 @@ async def mahdi_menu(event):
         "• `/note` | `/notes` | `/delnote` | `/clearnotes`\n"
         "• `/id` | `/info` | `/ping` | `/status` | `/stats` | `/time` | `/uuid`\n"
         "• `/calc` | `/rev` | `/upper` | `/lower` | `/len` | `/flip` | `/roll`\n\n"
-        f"⚙️ **الصوت:** {voice_state} | **AI:** {ai_state} | **AFK:** {afk_state} | **الاختصارات:** {sa_state} | **5:00:** {sched_state}"
+        f"⚙️ **الصوت:** {voice_state} | **mahdi.m4a:** {file_state} | **AI:** {ai_state} | **AFK:** {afk_state}"
     )
     await event.edit(menu_text)
 
 
-# ==========================================
-# مجموعة الاختصارات الذكية (/sa)
-# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/sa(?:\s+(\S+)(?:\s+(.+))?)?$"))
 async def sa_cmd(event):
     global COMMANDS_USED_COUNT
@@ -592,9 +516,6 @@ async def saoff_cmd(event):
     await event.edit("⏸️ تم **إيقاف** التوسيع التلقائي للاختصارات.")
 
 
-# ==========================================
-# مجموعة اللايكات والجدولة
-# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/like(?:\s+(\d+))?$"))
 async def manual_like(event):
     global COMMANDS_USED_COUNT
@@ -677,9 +598,6 @@ async def sched_cmd(event):
         await event.edit(f"⏰ **حالة الجدولة اليومية (5:00 فجراً بتوقيت السعودية):** {state}")
 
 
-# ==========================================
-# مجموعة الرد التلقائي AFK
-# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/afk$"))
 async def toggle_afk(event):
     global AFK_ENABLED, COMMANDS_USED_COUNT
@@ -728,9 +646,6 @@ async def afk_count_cmd(event):
     await event.edit(f"💬 عدد الردود التلقائية المرسلة منذ التشغيل: `{AFK_REPLIES_COUNT}`")
 
 
-# ==========================================
-# مجموعة الرسائل والتحرير
-# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/say\s+(.+)$"))
 async def say_cmd(event):
     global COMMANDS_USED_COUNT
@@ -814,9 +729,6 @@ async def copy_cmd(event):
     await event.edit(reply.raw_text)
 
 
-# ==========================================
-# مجموعة الملاحظات والأدوات والحالة والتسلية
-# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/note\s+(.+)$"))
 async def add_note_cmd(event):
     global COMMANDS_USED_COUNT
@@ -916,11 +828,13 @@ async def status_cmd(event):
     sched_state = "مفعل ✅" if DAILY_SCHED_ENABLED else "متوقف ⏸️"
     sa_state = "مفعل ✅" if SHORTCUTS_ENABLED else "متوقف ⏸️"
     ai_state = "مفعل ✅" if AI_ENABLED else "متوقف ⏸️"
-    voice_state = "جاهز ✅" if (VOICE_CALLS_AVAILABLE and YTDLP_AVAILABLE) else "يحتاج ffmpeg/pytgcalls ⚠️"
+    voice_state = "جاهز ✅" if VOICE_CALLS_AVAILABLE else "يحتاج ffmpeg/pytgcalls ⚠️"
+    file_state = "موجود ✅" if os.path.exists(LOCAL_AUDIO_FILE) else "غير مرفوع ⚠️"
     text = (
         "✅ **اليوزر بوت يعمل بكفاءة تامة**\n"
         f"⏱️ **مدة التشغيل:** `{format_uptime()}`\n"
         f"🎵 **البث الصوتي:** {voice_state}\n"
+        f"📁 **ملف mahdi.m4a:** {file_state}\n"
         f"🤖 **الذكاء الاصطناعي:** {ai_state}\n"
         f"💬 **الرد التلقائي:** {afk_state}\n"
         f"⚡ **الاختصارات:** {sa_state}\n"
@@ -1017,9 +931,6 @@ async def len_cmd(event):
     await event.edit(f"📏 **طول النص:** `{chars}` حرف | `{words}` كلمة")
 
 
-# ==========================================
-# معالج التوسيع التلقائي للاختصارات عند إرسالها لحالها
-# ==========================================
 @user_client.on(events.NewMessage(outgoing=True))
 async def expand_shortcut_handler(event):
     global SHORTCUT_TRIGGERS_COUNT
@@ -1045,9 +956,6 @@ async def expand_shortcut_handler(event):
         print(f"خطأ في توسيع الاختصار '{raw}': {e}")
 
 
-# ==========================================
-# الرد التلقائي على الخاص (AFK)
-# ==========================================
 @user_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
 async def auto_reply(event):
     global AFK_REPLIES_COUNT
@@ -1068,9 +976,6 @@ async def auto_reply(event):
         print(f"خطأ في الرد التلقائي: {e}")
 
 
-# ==========================================
-# الجدولة اليومية الساعة 5:00 فجراً
-# ==========================================
 async def daily_task():
     await asyncio.sleep(25)
     print("بدء نظام الجدولة اليومية لإرسال اللايك الساعة 5:00 فجراً...")
