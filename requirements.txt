@@ -1,6 +1,5 @@
-telethon
 fastapi
 uvicorn
+telethon
 httpx
 py-tgcalls
-yt-dlp
