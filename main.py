@@ -7,7 +7,7 @@ import asyncio
 from urllib.parse import quote, urlparse
 from datetime import datetime, timezone, timedelta
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -45,18 +45,21 @@ app = FastAPI()
 
 
 @app.get("/")
+@app.head("/")
 def home():
-    return {
-        "status": "Mahdi Userbot v8 (Radio/Live Stream + 24/7 Auto-Reconnect + Full Suite) is running!",
-        "voice_calls_ready": VOICE_CALLS_AVAILABLE,
-        "active_streams": len(ACTIVE_CALLS),
-    }
+    return Response(
+        content='{"status":"Mahdi Userbot v8.3 is live","voice_calls_ready":'
+        + ("true" if VOICE_CALLS_AVAILABLE else "false")
+        + "}",
+        media_type="application/json",
+    )
 
 
 user_client = TelegramClient(
     StringSession(SESSION_STRING) if SESSION_STRING else "user_session",
     API_ID,
     API_HASH,
+    sequential_updates=False,
 )
 
 call_py = PyTgCalls(user_client) if VOICE_CALLS_AVAILABLE else None
@@ -80,7 +83,6 @@ QURAN_STATIONS = {
     "luhaidan": ("الشيخ محمد اللحيدان", "https://backup.qurango.net/radio/mohammed_allohaidan"),
     "juhany": ("الشيخ عبدالله الجهني", "https://backup.qurango.net/radio/abdullah_aljohany"),
     "qatami": ("الشيخ ناصر القطامي", "https://backup.qurango.net/radio/nasser_alqatami"),
-    "muaiqly": ("الشيخ ماهر المعيقلي", "https://backup.qurango.net/radio/maher"),
     "makkah": ("إذاعة الحرم المكي", "https://backup.qurango.net/radio/salma"),
     "tarjama": ("الإذاعة العامة - تلاوات متنوعة", "https://backup.qurango.net/radio/tarateel"),
 }
@@ -169,18 +171,105 @@ async def ensure_call_py_ready() -> None:
         if call_py is None:
             call_py = PyTgCalls(user_client)
             _call_py_started = False
-        if not _call_py_started:
+        if _call_py_started:
+            return
+        try:
             await call_py.start()
             _call_py_started = True
+        except RuntimeError as e:
+            if "cannot be initialized more than once" in str(e).lower():
+                _call_py_started = True
+            else:
+                raise
 
 
-# ==========================================
-# محلل روابط الإذاعات والبث المباشر (qurango.net + روابط صوتية)
-# ==========================================
+async def unmute_in_call(chat_id: int) -> None:
+    if not call_py:
+        return
+    for method_name in ("unmute", "unmute_stream", "mute_status"):
+        fn = getattr(call_py, method_name, None)
+        if callable(fn):
+            try:
+                if method_name == "mute_status":
+                    res = fn(chat_id, muted=False)
+                else:
+                    res = fn(chat_id)
+                if asyncio.iscoroutine(res):
+                    await res
+                break
+            except Exception:
+                pass
+
+
+async def find_working_qurango_stream(slug: str, original_url: str) -> dict:
+    clean_slug = (slug or "").strip().strip("/")
+    candidates = [
+        f"https://backup.qurango.net/radio/{clean_slug}",
+        f"https://qurango.net/radio/{clean_slug}",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://qurango.net/",
+    }
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers=headers) as client:
+        for cand in candidates:
+            try:
+                async with client.stream("GET", cand) as resp:
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    final_url = str(resp.url)
+                    if resp.status_code == 200 and (
+                        "audio" in ctype
+                        or "mpeg" in ctype
+                        or "aac" in ctype
+                        or "ogg" in ctype
+                        or "octet-stream" in ctype
+                    ):
+                        readable = clean_slug.replace("_", " ").title()
+                        return {
+                            "stream_url": final_url,
+                            "title": f"إذاعة القرآن المباشرة ({readable})",
+                            "source_url": original_url,
+                            "is_live": True,
+                            "content_type": ctype,
+                        }
+            except Exception as e:
+                print(f"[QURANGO PROBE] {cand} -> {e}")
+                continue
+
+        try:
+            page = await client.get(original_url)
+            if page.status_code == 200 and page.text:
+                m = re.search(
+                    r"""https?://[^"'\s<>]+(?:qurango\.net/radio|radiojar|stream|icecast|\.mp3|\.aac|\.m3u8)[^"'\s<>]*""",
+                    page.text,
+                    re.IGNORECASE,
+                )
+                if m:
+                    extracted = m.group(0).replace("&amp;", "&")
+                    readable = clean_slug.replace("_", " ").title()
+                    return {
+                        "stream_url": extracted,
+                        "title": f"إذاعة القرآن المباشرة ({readable})",
+                        "source_url": original_url,
+                        "is_live": True,
+                        "content_type": "extracted-stream",
+                    }
+        except Exception as e:
+            print(f"[QURANGO HTML] {original_url} -> {e}")
+
+    readable = clean_slug.replace("_", " ").title()
+    return {
+        "stream_url": f"https://backup.qurango.net/radio/{clean_slug}",
+        "title": f"إذاعة القرآن المباشرة ({readable})",
+        "source_url": original_url,
+        "is_live": True,
+        "content_type": "direct-fallback",
+    }
+
+
 async def resolve_stream_source(query: str) -> dict:
     q = (query or "").strip()
 
-    # 1. بدون رابط أو طلب الملف المحلي mahdi.m4a
     if not q or q.lower() in {"mahdi", "mahdi.m4a", "local", "file"}:
         if not os.path.exists(LOCAL_AUDIO_FILE):
             raise FileNotFoundError(
@@ -193,7 +282,6 @@ async def resolve_stream_source(query: str) -> dict:
             "is_live": False,
         }
 
-    # 2. اختصار اسم قارئ من قائمة QURAN_STATIONS
     low_q = q.lower()
     if low_q in QURAN_STATIONS:
         name, direct_url = QURAN_STATIONS[low_q]
@@ -204,7 +292,6 @@ async def resolve_stream_source(query: str) -> dict:
             "is_live": True,
         }
 
-    # 3. ملف محلي موجود في المجلد
     candidate_path = os.path.join(BASE_DIR, q)
     if os.path.isfile(candidate_path):
         return {
@@ -214,70 +301,20 @@ async def resolve_stream_source(query: str) -> dict:
             "is_live": False,
         }
 
-    # 4. معالجة الروابط (https://...)
     if re.match(r"^https?://", q, re.IGNORECASE):
         parsed = urlparse(q)
         host = (parsed.hostname or "").lower()
         path = parsed.path or ""
 
-        # معالجة ذكية لروابط موقع qurango.net (مثل https://qurango.net/radio/yasser_aldosari)
         if "qurango.net" in host and "/radio/" in path:
             slug = path.rstrip("/").split("/")[-1]
-            # السيرفر الفعلي للبث المباشر في qurango هو backup.qurango.net أو stream.radiojar
-            candidate_urls = [
-                f"https://backup.qurango.net/radio/{slug}",
-                f"https://qurango.net/radio/{slug}",
-            ]
-            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-                for cand in candidate_urls:
-                    try:
-                        async with client.stream("GET", cand) as resp:
-                            ctype = (resp.headers.get("content-type") or "").lower()
-                            if resp.status_code == 200 and (
-                                "audio" in ctype or "octet-stream" in ctype or "mpeg" in ctype or "aac" in ctype
-                            ):
-                                final_url = str(resp.url)
-                                readable_name = slug.replace("_", " ").title()
-                                return {
-                                    "stream_url": final_url,
-                                    "title": f"إذاعة القرآن المباشرة ({readable_name})",
-                                    "source_url": q,
-                                    "is_live": True,
-                                }
-                    except Exception:
-                        continue
+            return await find_working_qurango_stream(slug, q)
 
-                # محاولة استخراج رابط البث من كود صفحة الويب إذا كانت صفحة HTML
-                try:
-                    page_resp = await client.get(q)
-                    html = page_resp.text
-                    m = re.search(
-                        r"""https?://[^"'\s<>]+(?:radiojar|qurango\.net/radio|\.mp3|\.aac|\.m3u8)[^"'\s<>]*""",
-                        html,
-                        re.IGNORECASE,
-                    )
-                    if m:
-                        extracted = m.group(0)
-                        return {
-                            "stream_url": extracted,
-                            "title": f"إذاعة القرآن المباشرة ({slug})",
-                            "source_url": q,
-                            "is_live": True,
-                        }
-                except Exception:
-                    pass
-
-            # كحل احتياطي مباشر لـ backup.qurango.net
-            return {
-                "stream_url": f"https://backup.qurango.net/radio/{slug}",
-                "title": f"إذاعة القرآن المباشرة ({slug})",
-                "source_url": q,
-                "is_live": True,
-            }
-
-        # فحص أي رابط آخر (MP3, M4A, AAC, M3U8, OGG, Icecast/Shoutcast)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        }
         try:
-            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=14.0, follow_redirects=True, headers=headers) as client:
                 async with client.stream("GET", q) as resp:
                     ctype = (resp.headers.get("content-type") or "").lower()
                     final_url = str(resp.url)
@@ -295,11 +332,11 @@ async def resolve_stream_source(query: str) -> dict:
                             "title": "بث صوتي مباشر من الرابط" if is_live else "ملف صوتي مباشر من الرابط",
                             "source_url": q,
                             "is_live": is_live,
+                            "content_type": ctype,
                         }
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[STREAM PROBE] {q} -> {e}")
 
-        # تمرير الرابط المباشر لـ ffmpeg/PyTgCalls كخيار أخير
         return {
             "stream_url": q,
             "title": "بث صوتي من الرابط",
@@ -315,6 +352,7 @@ async def resolve_stream_source(query: str) -> dict:
 async def play_track_in_call(chat_id: int, track: dict) -> None:
     global VOICE_PLAYS_COUNT, call_py, _call_py_started
     await ensure_call_py_ready()
+    print(f"[VOICE PLAY] chat={chat_id} title={track['title']} url={track['stream_url']}")
     try:
         await call_py.play(
             chat_id,
@@ -325,8 +363,7 @@ async def play_track_in_call(chat_id: int, track: dict) -> None:
             async with _call_py_lock:
                 call_py = PyTgCalls(user_client)
                 _call_py_started = False
-                await call_py.start()
-                _call_py_started = True
+                await ensure_call_py_ready()
             await call_py.play(
                 chat_id,
                 MediaStream(track["stream_url"]),
@@ -334,6 +371,7 @@ async def play_track_in_call(chat_id: int, track: dict) -> None:
         else:
             raise
 
+    await unmute_in_call(chat_id)
     ACTIVE_CALLS[chat_id] = {
         "title": track["title"],
         "source_url": track["source_url"],
@@ -345,9 +383,6 @@ async def play_track_in_call(chat_id: int, track: dict) -> None:
     VOICE_PLAYS_COUNT += 1
 
 
-# ==========================================
-# مراقب البث الدائم 24/7 (يعيد الاتصال تلقائياً إذا انقطع البث)
-# ==========================================
 async def stream_watchdog_loop(chat_id: int) -> None:
     global AUTO_RECONNECT_COUNT
     while chat_id in PERSISTENT_STREAMS and chat_id not in USER_STOPPED_CHATS:
@@ -403,9 +438,6 @@ async def stop_persistent_stream(chat_id: int) -> None:
             pass
 
 
-# ==========================================
-# دالة الذكاء الاصطناعي المجاني
-# ==========================================
 async def ask_free_ai(prompt: str) -> str:
     url = f"https://text.pollinations.ai/{quote(prompt)}"
     try:
@@ -422,9 +454,6 @@ async def ask_free_ai(prompt: str) -> str:
         return f"❌ تعذر الاتصال بالذكاء الاصطناعي حالياً: {e}"
 
 
-# ==========================================
-# دالة إرسال اللايك وانتظار النتيجة
-# ==========================================
 async def execute_like_and_fetch_result(uid: str = DEFAULT_UID) -> str:
     global LIKE_RUNS_COUNT
     LIKE_RUNS_COUNT += 1
@@ -449,12 +478,12 @@ async def execute_like_and_fetch_result(uid: str = DEFAULT_UID) -> str:
 
 # ==========================================
 # أوامر المكالمات الصوتية والمرئية والبث الدائم
-# /voic  |  /vioc  |  /stopvoic  |  /vstop  |  /quran
 # ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/(?:voic|vioc)(?:\s+(.+))?$"))
 async def voic_play_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
+    print(f"[CMD] /voic triggered in chat={event.chat_id}")
 
     if event.is_private:
         await event.edit("⚠️ هذا الأمر يعمل داخل **القروبات** التي تحتوي على محادثة صوتية/مرئية مفتوحة.")
@@ -463,10 +492,7 @@ async def voic_play_cmd(event):
     query = (event.pattern_match.group(1) or "").strip()
 
     if not VOICE_CALLS_AVAILABLE:
-        await event.edit(
-            "❌ **تجهيز السيرفر مطلوب لتشغيل المكالمات:**\n"
-            "تأكد من تثبيت `py-tgcalls` و `ffmpeg` على السيرفر."
-        )
+        await event.edit("❌ تأكد من تثبيت `py-tgcalls` و `ffmpeg` على السيرفر.")
         return
 
     status = await event.edit("🔊 جاري سحب رابط البث والانضمام لمكالمة القروب...")
@@ -478,24 +504,21 @@ async def voic_play_cmd(event):
         await status.edit(
             f"🔊 **تم الدخول للمكالمة وبدأ البث الصوتي بنجاح!**\n\n"
             f"📻 **البث:** {track['title']}\n"
+            f"📡 **رابط البث الفعلي:** `{track['stream_url']}`\n"
             f"🔄 **الوضع:** {mode_label} (يعيد الاتصال تلقائياً عند الانقطاع)\n"
             f"🔗 **الرابط:** `{track['source_url']}`\n"
             f"🛑 **للإيقاف:** أرسل `/stopvoic`"
         )
     except Exception as e:
-        await status.edit(
-            f"❌ **تعذر تشغيل البث في المكالمة:**\n`{e}`\n\n"
-            "💡 تأكد أن المحادثة الصوتية/المرئية مفتوحة داخل القروب وأن الرابط صالح."
-        )
+        print(f"[ERR] /voic error: {e}")
+        await status.edit(f"❌ **تعذر تشغيل البث في المكالمة:**\n`{e}`")
 
 
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/(?:stopvoic|stopvioc|vstop)$"))
 async def stopvoic_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
-    if not VOICE_CALLS_AVAILABLE:
-        await event.edit("❌ خدمة المكالمات غير مفعلة.")
-        return
+    print(f"[CMD] /stopvoic triggered in chat={event.chat_id}")
     await stop_persistent_stream(event.chat_id)
     await event.edit("⏹️ **تم إيقاف البث الصوتي الدائم ومغادرة المكالمة بنجاح.**")
 
@@ -512,8 +535,6 @@ async def quran_stations_cmd(event):
             "اكتب `/voic <الاسم>` أو `/quran <الاسم>` داخل القروب لتشغيلها فوراً:\n",
         ]
         for key, (name, _) in QURAN_STATIONS.items():
-            if key == "muaiqly":
-                continue
             lines.append(f"• `/voic {key}` — {name}")
         lines.append("\nأو أرسل أي رابط مباشر مثل:\n`/voic https://qurango.net/radio/yasser_aldosari`")
         await event.edit("\n".join(lines))
@@ -679,11 +700,12 @@ async def ai_cmd(event):
 async def mahdi_menu(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
+    print(f"[CMD] /mahdi triggered in chat={event.chat_id}")
     afk_state = "مفعل ✅" if AFK_ENABLED else "متوقف ⏸️"
     ai_state = "مفعل ✅" if AI_ENABLED else "متوقف ⏸️"
     voice_state = "جاهز ✅" if VOICE_CALLS_AVAILABLE else "يحتاج ffmpeg/pytgcalls ⚠️"
     menu_text = (
-        "👑 **قائمة أوامر يوزر بوت مهدي v8 (56 ميزة):**\n\n"
+        "👑 **قائمة أوامر يوزر بوت مهدي v8.3 (56 ميزة):**\n\n"
         "**📻 البث الصوتي والمكالمات المرئية الدائمة (24/7):**\n"
         "• `/voic <رابط إذاعة أو صوت>` — دخول المكالمة وبث الرابط بشكل دائمي\n"
         "  مثال: `/voic https://qurango.net/radio/yasser_aldosari`\n"
@@ -1096,6 +1118,7 @@ async def info_cmd(event):
 async def ping_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
+    print(f"[CMD] /ping triggered in chat={event.chat_id}")
     t0 = time.perf_counter()
     await event.edit("🏓 جاري قياس السرعة...")
     ms = int((time.perf_counter() - t0) * 1000)
@@ -1277,14 +1300,22 @@ async def daily_task():
 
 
 async def start_services():
-    await user_client.start()
     try:
-        await ensure_call_py_ready()
-        print("تم تفعيل محرك المكالمات الصوتية PyTgCalls على نفس الـ loop بنجاح!")
+        if not user_client.is_connected():
+            await user_client.connect()
+        if not await user_client.is_user_authorized():
+            await user_client.start()
+        me = await user_client.get_me()
+        print(f"تم تسجيل الدخول بنجاح لحساب: {getattr(me, 'first_name', '')} (ID: {getattr(me, 'id', '')})")
+        asyncio.create_task(user_client.run_until_disconnected())
+        try:
+            await ensure_call_py_ready()
+            print("تم تفعيل محرك المكالمات الصوتية PyTgCalls على نفس الـ loop بنجاح!")
+        except Exception as e:
+            print(f"تنبيه: تعذر تشغيل PyTgCalls عند الإقلاع: {e}")
+        asyncio.create_task(daily_task())
     except Exception as e:
-        print(f"تنبيه: تعذر تشغيل PyTgCalls عند الإقلاع: {e}")
-    print("تم تشغيل اليوزر بوت بنجاح تام عبر SESSION_STRING!")
-    asyncio.create_task(daily_task())
+        print(f"❌ خطأ جسيم أثناء تشغيل خدمات اليوزر بوت: {e}")
 
 
 @app.on_event("startup")
