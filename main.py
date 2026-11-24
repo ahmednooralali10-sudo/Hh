@@ -4,7 +4,7 @@ import time
 import uuid
 import random
 import asyncio
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from datetime import datetime, timezone, timedelta
 import httpx
 from fastapi import FastAPI
@@ -47,9 +47,9 @@ app = FastAPI()
 @app.get("/")
 def home():
     return {
-        "status": "Mahdi Userbot (Local mahdi.m4a + Voice + AI) is running!",
+        "status": "Mahdi Userbot v8 (Radio/Live Stream + 24/7 Auto-Reconnect + Full Suite) is running!",
         "voice_calls_ready": VOICE_CALLS_AVAILABLE,
-        "local_audio_exists": os.path.exists(LOCAL_AUDIO_FILE),
+        "active_streams": len(ACTIVE_CALLS),
     }
 
 
@@ -62,6 +62,28 @@ user_client = TelegramClient(
 call_py = PyTgCalls(user_client) if VOICE_CALLS_AVAILABLE else None
 _call_py_started = False
 _call_py_lock = asyncio.Lock()
+
+# ==========================================
+# قائمة إذاعات القرآن الجاهزة السريعة (/quran)
+# ==========================================
+QURAN_STATIONS = {
+    "yasser": ("الشيخ ياسر الدوسري", "https://backup.qurango.net/radio/yasser_aldosari"),
+    "maher": ("الشيخ ماهر المعيقلي", "https://backup.qurango.net/radio/maher"),
+    "sudais": ("الشيخ عبدالرحمن السديس", "https://backup.qurango.net/radio/abdulrahman_alsudaes"),
+    "shuraim": ("الشيخ سعود الشريم", "https://backup.qurango.net/radio/saud_alshuraim"),
+    "afasy": ("الشيخ مشاري العفاسي", "https://backup.qurango.net/radio/mishary_alafasi"),
+    "ajmy": ("الشيخ أحمد العجمي", "https://backup.qurango.net/radio/ahmad_alajmy"),
+    "dosari": ("الشيخ إبراهيم الدوسري", "https://backup.qurango.net/radio/ibrahim_aldosari"),
+    "minshawi": ("الشيخ محمد صديق المنشاوي", "https://backup.qurango.net/radio/mohammed_siddiq_alminshawi"),
+    "husary": ("الشيخ محمود خليل الحصري", "https://backup.qurango.net/radio/mahmoud_khalil_alhussary"),
+    "basit": ("الشيخ عبدالباسط عبدالصمد", "https://backup.qurango.net/radio/abdulbasit_abdulsamad_mojawwad"),
+    "luhaidan": ("الشيخ محمد اللحيدان", "https://backup.qurango.net/radio/mohammed_allohaidan"),
+    "juhany": ("الشيخ عبدالله الجهني", "https://backup.qurango.net/radio/abdullah_aljohany"),
+    "qatami": ("الشيخ ناصر القطامي", "https://backup.qurango.net/radio/nasser_alqatami"),
+    "muaiqly": ("الشيخ ماهر المعيقلي", "https://backup.qurango.net/radio/maher"),
+    "makkah": ("إذاعة الحرم المكي", "https://backup.qurango.net/radio/salma"),
+    "tarjama": ("الإذاعة العامة - تلاوات متنوعة", "https://backup.qurango.net/radio/tarateel"),
+}
 
 # ==========================================
 # حالة التشغيل والذاكرة المؤقتة
@@ -79,6 +101,7 @@ COMMANDS_USED_COUNT = 0
 SHORTCUT_TRIGGERS_COUNT = 0
 AI_REQUESTS_COUNT = 0
 VOICE_PLAYS_COUNT = 0
+AUTO_RECONNECT_COUNT = 0
 
 LAST_RESULT = "لم يتم تسجيل أي نتيجة لايك حتى الآن."
 RESULT_HISTORY: list[str] = []
@@ -86,6 +109,9 @@ SHORTCUTS: dict[str, list[str]] = {}
 NOTES: list[str] = []
 ACTIVE_CALLS: dict[int, dict] = {}
 VOICE_QUEUES: dict[int, list[dict]] = {}
+PERSISTENT_STREAMS: dict[int, dict] = {}
+STREAM_WATCHDOGS: dict[int, asyncio.Task] = {}
+USER_STOPPED_CHATS: set[int] = set()
 
 
 def record_history(entry: str) -> None:
@@ -148,45 +174,145 @@ async def ensure_call_py_ready() -> None:
             _call_py_started = True
 
 
-def resolve_local_or_url_track(query: str) -> dict:
+# ==========================================
+# محلل روابط الإذاعات والبث المباشر (qurango.net + روابط صوتية)
+# ==========================================
+async def resolve_stream_source(query: str) -> dict:
     q = (query or "").strip()
+
+    # 1. بدون رابط أو طلب الملف المحلي mahdi.m4a
     if not q or q.lower() in {"mahdi", "mahdi.m4a", "local", "file"}:
         if not os.path.exists(LOCAL_AUDIO_FILE):
             raise FileNotFoundError(
-                "لم يتم العثور على الملف mahdi.m4a داخل مجلد المشروع. ارفع mahdi.m4a بجانب main.py في GitHub."
+                "لم يتم العثور على mahdi.m4a. ارفع الملف في المجلد أو أرسل رابط إذاعة مثل: `/voic https://qurango.net/radio/yasser_aldosari`"
             )
         return {
             "stream_url": LOCAL_AUDIO_FILE,
             "title": "mahdi.m4a (ملف صوتي محلي)",
-            "duration": 0,
-            "webpage_url": "ملف محلي داخل المجلد",
+            "source_url": "ملف محلي داخل المجلد",
+            "is_live": False,
         }
 
+    # 2. اختصار اسم قارئ من قائمة QURAN_STATIONS
+    low_q = q.lower()
+    if low_q in QURAN_STATIONS:
+        name, direct_url = QURAN_STATIONS[low_q]
+        return {
+            "stream_url": direct_url,
+            "title": f"إذاعة {name} (بث مباشر 24/7)",
+            "source_url": direct_url,
+            "is_live": True,
+        }
+
+    # 3. ملف محلي موجود في المجلد
     candidate_path = os.path.join(BASE_DIR, q)
     if os.path.isfile(candidate_path):
         return {
             "stream_url": candidate_path,
             "title": f"{os.path.basename(candidate_path)} (ملف صوتي محلي)",
-            "duration": 0,
-            "webpage_url": "ملف محلي داخل المجلد",
+            "source_url": "ملف محلي داخل المجلد",
+            "is_live": False,
         }
 
-    if re.match(r"^https?://", q, re.IGNORECASE) and re.search(
-        r"\.(mp3|m4a|ogg|wav|flac|aac|opus)(\?.*)?$", q, re.IGNORECASE
-    ):
+    # 4. معالجة الروابط (https://...)
+    if re.match(r"^https?://", q, re.IGNORECASE):
+        parsed = urlparse(q)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path or ""
+
+        # معالجة ذكية لروابط موقع qurango.net (مثل https://qurango.net/radio/yasser_aldosari)
+        if "qurango.net" in host and "/radio/" in path:
+            slug = path.rstrip("/").split("/")[-1]
+            # السيرفر الفعلي للبث المباشر في qurango هو backup.qurango.net أو stream.radiojar
+            candidate_urls = [
+                f"https://backup.qurango.net/radio/{slug}",
+                f"https://qurango.net/radio/{slug}",
+            ]
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                for cand in candidate_urls:
+                    try:
+                        async with client.stream("GET", cand) as resp:
+                            ctype = (resp.headers.get("content-type") or "").lower()
+                            if resp.status_code == 200 and (
+                                "audio" in ctype or "octet-stream" in ctype or "mpeg" in ctype or "aac" in ctype
+                            ):
+                                final_url = str(resp.url)
+                                readable_name = slug.replace("_", " ").title()
+                                return {
+                                    "stream_url": final_url,
+                                    "title": f"إذاعة القرآن المباشرة ({readable_name})",
+                                    "source_url": q,
+                                    "is_live": True,
+                                }
+                    except Exception:
+                        continue
+
+                # محاولة استخراج رابط البث من كود صفحة الويب إذا كانت صفحة HTML
+                try:
+                    page_resp = await client.get(q)
+                    html = page_resp.text
+                    m = re.search(
+                        r"""https?://[^"'\s<>]+(?:radiojar|qurango\.net/radio|\.mp3|\.aac|\.m3u8)[^"'\s<>]*""",
+                        html,
+                        re.IGNORECASE,
+                    )
+                    if m:
+                        extracted = m.group(0)
+                        return {
+                            "stream_url": extracted,
+                            "title": f"إذاعة القرآن المباشرة ({slug})",
+                            "source_url": q,
+                            "is_live": True,
+                        }
+                except Exception:
+                    pass
+
+            # كحل احتياطي مباشر لـ backup.qurango.net
+            return {
+                "stream_url": f"https://backup.qurango.net/radio/{slug}",
+                "title": f"إذاعة القرآن المباشرة ({slug})",
+                "source_url": q,
+                "is_live": True,
+            }
+
+        # فحص أي رابط آخر (MP3, M4A, AAC, M3U8, OGG, Icecast/Shoutcast)
+        try:
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+                async with client.stream("GET", q) as resp:
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    final_url = str(resp.url)
+                    if resp.status_code < 400 and (
+                        "audio" in ctype
+                        or "mpegurl" in ctype
+                        or "octet-stream" in ctype
+                        or re.search(r"\.(mp3|m4a|ogg|wav|flac|aac|opus|m3u8|pls)(\?.*)?$", final_url, re.IGNORECASE)
+                    ):
+                        is_live = not bool(
+                            re.search(r"\.(mp3|m4a|ogg|wav|flac|aac|opus)(\?.*)?$", final_url, re.IGNORECASE)
+                        )
+                        return {
+                            "stream_url": final_url,
+                            "title": "بث صوتي مباشر من الرابط" if is_live else "ملف صوتي مباشر من الرابط",
+                            "source_url": q,
+                            "is_live": is_live,
+                        }
+        except Exception:
+            pass
+
+        # تمرير الرابط المباشر لـ ffmpeg/PyTgCalls كخيار أخير
         return {
             "stream_url": q,
-            "title": "ملف صوتي مباشر من الرابط",
-            "duration": 0,
-            "webpage_url": q,
+            "title": "بث صوتي من الرابط",
+            "source_url": q,
+            "is_live": True,
         }
 
     raise RuntimeError(
-        "أرسل `/vioc` أو `/vioc mahdi.m4a` لتشغيل ملفك المحلي داخل المجلد، أو أرسل رابط ملف صوتي مباشر (.mp3 / .m4a / .ogg)."
+        "أرسل رابط إذاعة أو صوت مباشر مثل:\n`/voic https://qurango.net/radio/yasser_aldosari`\nأو اكتب `/quran` لعرض الإذاعات الجاهزة."
     )
 
 
-async def start_voice_stream(chat_id: int, track: dict) -> None:
+async def play_track_in_call(chat_id: int, track: dict) -> None:
     global VOICE_PLAYS_COUNT, call_py, _call_py_started
     await ensure_call_py_ready()
     try:
@@ -210,14 +336,76 @@ async def start_voice_stream(chat_id: int, track: dict) -> None:
 
     ACTIVE_CALLS[chat_id] = {
         "title": track["title"],
-        "duration": track["duration"],
-        "url": track["webpage_url"],
+        "source_url": track["source_url"],
+        "stream_url": track["stream_url"],
+        "is_live": track.get("is_live", True),
         "paused": False,
         "started_at": time.time(),
     }
     VOICE_PLAYS_COUNT += 1
 
 
+# ==========================================
+# مراقب البث الدائم 24/7 (يعيد الاتصال تلقائياً إذا انقطع البث)
+# ==========================================
+async def stream_watchdog_loop(chat_id: int) -> None:
+    global AUTO_RECONNECT_COUNT
+    while chat_id in PERSISTENT_STREAMS and chat_id not in USER_STOPPED_CHATS:
+        await asyncio.sleep(20)
+        if chat_id not in PERSISTENT_STREAMS or chat_id in USER_STOPPED_CHATS:
+            break
+        current = ACTIVE_CALLS.get(chat_id)
+        if current and current.get("paused"):
+            continue
+        try:
+            active_list = []
+            if call_py and hasattr(call_py, "calls"):
+                calls_obj = call_py.calls
+                if callable(calls_obj):
+                    res = calls_obj()
+                    active_list = await res if asyncio.iscoroutine(res) else list(res)
+                elif isinstance(calls_obj, dict):
+                    active_list = list(calls_obj.keys())
+
+            in_call = any(
+                (item == chat_id or getattr(item, "chat_id", None) == chat_id)
+                for item in active_list
+            )
+            if not in_call and chat_id in PERSISTENT_STREAMS:
+                track = PERSISTENT_STREAMS[chat_id]
+                await play_track_in_call(chat_id, track)
+                AUTO_RECONNECT_COUNT += 1
+        except Exception as e:
+            print(f"[Watchdog {chat_id}] محاولة إعادة ربط البث الدائم: {e}")
+
+
+def start_persistent_watchdog(chat_id: int, track: dict) -> None:
+    USER_STOPPED_CHATS.discard(chat_id)
+    PERSISTENT_STREAMS[chat_id] = track
+    old_task = STREAM_WATCHDOGS.get(chat_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    STREAM_WATCHDOGS[chat_id] = asyncio.create_task(stream_watchdog_loop(chat_id))
+
+
+async def stop_persistent_stream(chat_id: int) -> None:
+    USER_STOPPED_CHATS.add(chat_id)
+    PERSISTENT_STREAMS.pop(chat_id, None)
+    ACTIVE_CALLS.pop(chat_id, None)
+    VOICE_QUEUES.pop(chat_id, None)
+    task = STREAM_WATCHDOGS.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
+    if call_py:
+        try:
+            await call_py.leave_call(chat_id)
+        except Exception:
+            pass
+
+
+# ==========================================
+# دالة الذكاء الاصطناعي المجاني
+# ==========================================
 async def ask_free_ai(prompt: str) -> str:
     url = f"https://text.pollinations.ai/{quote(prompt)}"
     try:
@@ -234,6 +422,9 @@ async def ask_free_ai(prompt: str) -> str:
         return f"❌ تعذر الاتصال بالذكاء الاصطناعي حالياً: {e}"
 
 
+# ==========================================
+# دالة إرسال اللايك وانتظار النتيجة
+# ==========================================
 async def execute_like_and_fetch_result(uid: str = DEFAULT_UID) -> str:
     global LIKE_RUNS_COUNT
     LIKE_RUNS_COUNT += 1
@@ -257,40 +448,97 @@ async def execute_like_and_fetch_result(uid: str = DEFAULT_UID) -> str:
 
 
 # ==========================================
-# أوامر المكالمات الصوتية وبث الملفات (/vioc و /voic)
+# أوامر المكالمات الصوتية والمرئية والبث الدائم
+# /voic  |  /vioc  |  /stopvoic  |  /vstop  |  /quran
 # ==========================================
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/(?:vioc|voic)(?:\s+(.+))?$"))
-async def vioc_play_cmd(event):
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/(?:voic|vioc)(?:\s+(.+))?$"))
+async def voic_play_cmd(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
 
     if event.is_private:
-        await event.edit("⚠️ هذا الأمر يعمل داخل **القروبات** التي تحتوي على محادثة صوتية نشطة.")
+        await event.edit("⚠️ هذا الأمر يعمل داخل **القروبات** التي تحتوي على محادثة صوتية/مرئية مفتوحة.")
         return
 
     query = (event.pattern_match.group(1) or "").strip()
 
     if not VOICE_CALLS_AVAILABLE:
         await event.edit(
-            "❌ **تجهيز السيرفر مطلوب لتشغيل المكالمات الصوتية:**\n"
+            "❌ **تجهيز السيرفر مطلوب لتشغيل المكالمات:**\n"
             "تأكد من تثبيت `py-tgcalls` و `ffmpeg` على السيرفر."
         )
         return
 
-    status = await event.edit("🔊 جاري تجهيز ملف `mahdi.m4a` والانضمام لمكالمة القروب...")
+    status = await event.edit("🔊 جاري سحب رابط البث والانضمام لمكالمة القروب...")
     try:
-        track = resolve_local_or_url_track(query)
-        await start_voice_stream(event.chat_id, track)
+        track = await resolve_stream_source(query)
+        await play_track_in_call(event.chat_id, track)
+        start_persistent_watchdog(event.chat_id, track)
+        mode_label = "بث مباشر دائم 24/7 ♾️" if track.get("is_live") else "ملف صوتي 🎵"
         await status.edit(
-            f"🔊 **تم الدخول للمكالمة وبدأ تشغيل الصوت!**\n\n"
-            f"🎵 **الملف / المقطع:** {track['title']}\n"
-            f"📍 **المصدر:** {track['webpage_url']}"
+            f"🔊 **تم الدخول للمكالمة وبدأ البث الصوتي بنجاح!**\n\n"
+            f"📻 **البث:** {track['title']}\n"
+            f"🔄 **الوضع:** {mode_label} (يعيد الاتصال تلقائياً عند الانقطاع)\n"
+            f"🔗 **الرابط:** `{track['source_url']}`\n"
+            f"🛑 **للإيقاف:** أرسل `/stopvoic`"
         )
     except Exception as e:
         await status.edit(
-            f"❌ **تعذر تشغيل الصوت في المكالمة:**\n`{e}`\n\n"
-            "💡 تأكد من وجود `mahdi.m4a` داخل مجلد المشروع وأن المحادثة الصوتية مفتوحة في القروب."
+            f"❌ **تعذر تشغيل البث في المكالمة:**\n`{e}`\n\n"
+            "💡 تأكد أن المحادثة الصوتية/المرئية مفتوحة داخل القروب وأن الرابط صالح."
         )
+
+
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/(?:stopvoic|stopvioc|vstop)$"))
+async def stopvoic_cmd(event):
+    global COMMANDS_USED_COUNT
+    COMMANDS_USED_COUNT += 1
+    if not VOICE_CALLS_AVAILABLE:
+        await event.edit("❌ خدمة المكالمات غير مفعلة.")
+        return
+    await stop_persistent_stream(event.chat_id)
+    await event.edit("⏹️ **تم إيقاف البث الصوتي الدائم ومغادرة المكالمة بنجاح.**")
+
+
+@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/quran(?:\s+(\S+))?$"))
+async def quran_stations_cmd(event):
+    global COMMANDS_USED_COUNT
+    COMMANDS_USED_COUNT += 1
+    station_key = (event.pattern_match.group(1) or "").strip().lower()
+
+    if not station_key:
+        lines = [
+            "🕌 **إذاعات القرآن الكريم المباشرة (24/7):**\n",
+            "اكتب `/voic <الاسم>` أو `/quran <الاسم>` داخل القروب لتشغيلها فوراً:\n",
+        ]
+        for key, (name, _) in QURAN_STATIONS.items():
+            if key == "muaiqly":
+                continue
+            lines.append(f"• `/voic {key}` — {name}")
+        lines.append("\nأو أرسل أي رابط مباشر مثل:\n`/voic https://qurango.net/radio/yasser_aldosari`")
+        await event.edit("\n".join(lines))
+        return
+
+    if event.is_private:
+        await event.edit("⚠️ افتح المحادثة الصوتية في القروب ثم أرسل `/quran " + station_key + "`.")
+        return
+
+    if station_key not in QURAN_STATIONS:
+        await event.edit(f"⚠️ الإذاعة `{station_key}` غير موجودة. أرسل `/quran` لعرض القائمة الكاملة.")
+        return
+
+    status = await event.edit(f"🕌 جاري تشغيل إذاعة **{QURAN_STATIONS[station_key][0]}**...")
+    try:
+        track = await resolve_stream_source(station_key)
+        await play_track_in_call(event.chat_id, track)
+        start_persistent_watchdog(event.chat_id, track)
+        await status.edit(
+            f"🕌 **تم تشغيل البث المباشر الدائم 24/7!**\n\n"
+            f"📻 **الإذاعة:** {track['title']}\n"
+            f"🛑 **للإيقاف:** `/stopvoic`"
+        )
+    except Exception as e:
+        await status.edit(f"❌ تعذر تشغيل الإذاعة: `{e}`")
 
 
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/vqueue\s+(.+)$"))
@@ -300,13 +548,10 @@ async def vqueue_cmd(event):
     if event.is_private:
         await event.edit("⚠️ يعمل هذا الأمر داخل القروبات فقط.")
         return
-    if not VOICE_CALLS_AVAILABLE:
-        await event.edit("❌ مكتبات الصوت غير مثبتة على السيرفر.")
-        return
     query = event.pattern_match.group(1).strip()
-    msg = await event.edit("⏳ جاري إضافة المقطع لقائمة الانتظار...")
+    msg = await event.edit("⏳ جاري إضافة الرابط لقائمة الانتظار...")
     try:
-        track = resolve_local_or_url_track(query)
+        track = await resolve_stream_source(query)
         VOICE_QUEUES.setdefault(event.chat_id, []).append(track)
         pos = len(VOICE_QUEUES[event.chat_id])
         await msg.edit(f"➕ **تمت الإضافة لقائمة الانتظار (الترتيب #{pos}):**\n🎵 {track['title']}")
@@ -320,12 +565,13 @@ async def vskip_cmd(event):
     COMMANDS_USED_COUNT += 1
     queue = VOICE_QUEUES.get(event.chat_id, [])
     if not queue:
-        await event.edit("📭 قائمة الانتظار فارغة. استخدم `/vstop` لإنهاء المكالمة.")
+        await event.edit("📭 قائمة الانتظار فارغة. استخدم `/stopvoic` لإنهاء المكالمة.")
         return
     next_track = queue.pop(0)
-    msg = await event.edit("⏭️ جاري التخطي للمقطع التالي...")
+    msg = await event.edit("⏭️ جاري التخطي للبث التالي...")
     try:
-        await start_voice_stream(event.chat_id, next_track)
+        await play_track_in_call(event.chat_id, next_track)
+        start_persistent_watchdog(event.chat_id, next_track)
         await msg.edit(f"🔊 **يُعرض الآن:** {next_track['title']}")
     except Exception as e:
         await msg.edit(f"❌ تعذر التخطي: `{e}`")
@@ -342,7 +588,7 @@ async def vpause_cmd(event):
         await call_py.pause(event.chat_id)
         if event.chat_id in ACTIVE_CALLS:
             ACTIVE_CALLS[event.chat_id]["paused"] = True
-        await event.edit("⏸️ تم إيقاف الصوت مؤقتاً في المكالمة.")
+        await event.edit("⏸️ تم إيقاف الصوت مؤقتاً. أرسل `/vresume` للاستئناف.")
     except Exception as e:
         await event.edit(f"❌ تعذر الإيقاف المؤقت: `{e}`")
 
@@ -363,22 +609,6 @@ async def vresume_cmd(event):
         await event.edit(f"❌ تعذر الاستئناف: `{e}`")
 
 
-@user_client.on(events.NewMessage(outgoing=True, pattern=r"^/vstop$"))
-async def vstop_cmd(event):
-    global COMMANDS_USED_COUNT
-    COMMANDS_USED_COUNT += 1
-    if not call_py:
-        await event.edit("❌ خدمة المكالمات غير مفعلة.")
-        return
-    try:
-        await call_py.leave_call(event.chat_id)
-        ACTIVE_CALLS.pop(event.chat_id, None)
-        VOICE_QUEUES.pop(event.chat_id, None)
-        await event.edit("⏹️ تم إيقاف البث ومغادرة مكالمة القروب.")
-    except Exception as e:
-        await event.edit(f"❌ تعذر مغادرة المكالمة: `{e}`")
-
-
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/vnow$"))
 async def vnow_cmd(event):
     global COMMANDS_USED_COUNT
@@ -387,16 +617,24 @@ async def vnow_cmd(event):
     if not current:
         await event.edit("🔇 لا يوجد بث صوتي نشط حالياً في هذا القروب.")
         return
-    state = "متوقف مؤقتاً ⏸️" if current.get("paused") else "يعمل الآن 🔊"
+    state = "متوقف مؤقتاً ⏸️" if current.get("paused") else "يعمل الآن بشكل دائم 24/7 🔊"
     q_len = len(VOICE_QUEUES.get(event.chat_id, []))
+    elapsed = int(time.time() - current.get("started_at", time.time()))
+    mins, secs = divmod(elapsed, 60)
+    hours, mins = divmod(mins, 60)
     await event.edit(
         f"🎧 **حالة البث الصوتي في القروب:**\n"
-        f"• **الملف / المقطع:** {current['title']}\n"
+        f"• **البث:** {current['title']}\n"
         f"• **الحالة:** {state}\n"
+        f"• **مدة البث المتواصل:** `{hours}س {mins}د {secs}ث`\n"
+        f"• **مرات إعادة الاتصال التلقائي:** `{AUTO_RECONNECT_COUNT}`\n"
         f"• **في الانتظار:** `{q_len}` مقاطع"
     )
 
 
+# ==========================================
+# أمر الذكاء الاصطناعي للجميع (/ai)
+# ==========================================
 @user_client.on(events.NewMessage(pattern=r"(?s)^/ai(?:\s+(.+))?$"))
 async def ai_cmd(event):
     global AI_REQUESTS_COUNT, AI_ENABLED
@@ -434,22 +672,24 @@ async def ai_cmd(event):
         await thinking.edit(f"🤖 **الرد:**\n\n{answer}")
 
 
+# ==========================================
+# القائمة الرئيسية الشاملة (/mahdi)
+# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/mahdi$"))
 async def mahdi_menu(event):
     global COMMANDS_USED_COUNT
     COMMANDS_USED_COUNT += 1
     afk_state = "مفعل ✅" if AFK_ENABLED else "متوقف ⏸️"
-    sched_state = "مفعل ✅" if DAILY_SCHED_ENABLED else "متوقف ⏸️"
-    sa_state = "مفعل ✅" if SHORTCUTS_ENABLED else "متوقف ⏸️"
     ai_state = "مفعل ✅" if AI_ENABLED else "متوقف ⏸️"
     voice_state = "جاهز ✅" if VOICE_CALLS_AVAILABLE else "يحتاج ffmpeg/pytgcalls ⚠️"
-    file_state = "موجود ✅" if os.path.exists(LOCAL_AUDIO_FILE) else "غير مرفوع ⚠️"
     menu_text = (
-        "👑 **قائمة أوامر يوزر بوت مهدي (53 ميزة):**\n\n"
-        "**🎵 المكالمات الصوتية (ملف mahdi.m4a):**\n"
-        "• `/vioc` أو `/voic` — دخول مكالمة القروب وتشغيل `mahdi.m4a` مباشرة\n"
-        "• `/vioc mahdi.m4a` أو `/vioc <رابط صوت مباشر>`\n"
-        "• `/vqueue <ملف/رابط>` | `/vskip` | `/vpause` | `/vresume` | `/vstop` | `/vnow`\n\n"
+        "👑 **قائمة أوامر يوزر بوت مهدي v8 (56 ميزة):**\n\n"
+        "**📻 البث الصوتي والمكالمات المرئية الدائمة (24/7):**\n"
+        "• `/voic <رابط إذاعة أو صوت>` — دخول المكالمة وبث الرابط بشكل دائمي\n"
+        "  مثال: `/voic https://qurango.net/radio/yasser_aldosari`\n"
+        "• `/stopvoic` — إيقاف البث الدائم ومغادرة المكالمة فوراً\n"
+        "• `/quran` — قائمة 15 إذاعة قرآن جاهزة للتشغيل الفوري\n"
+        "• `/vnow` | `/vpause` | `/vresume` | `/vqueue` | `/vskip`\n\n"
         "**🤖 الذكاء الاصطناعي (متاح للجميع):**\n"
         "• `/ai <النص>` — سؤال الذكاء الاصطناعي المجاني\n"
         "• `/ai on` و `/ai off` — تشغيل أو إيقاف `/ai` (لك فقط)\n\n"
@@ -470,11 +710,14 @@ async def mahdi_menu(event):
         "• `/note` | `/notes` | `/delnote` | `/clearnotes`\n"
         "• `/id` | `/info` | `/ping` | `/status` | `/stats` | `/time` | `/uuid`\n"
         "• `/calc` | `/rev` | `/upper` | `/lower` | `/len` | `/flip` | `/roll`\n\n"
-        f"⚙️ **الصوت:** {voice_state} | **mahdi.m4a:** {file_state} | **AI:** {ai_state} | **AFK:** {afk_state}"
+        f"⚙️ **البث الصوتي:** {voice_state} | **AI:** {ai_state} | **AFK:** {afk_state}"
     )
     await event.edit(menu_text)
 
 
+# ==========================================
+# مجموعة الاختصارات الذكية (/sa)
+# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/sa(?:\s+(\S+)(?:\s+(.+))?)?$"))
 async def sa_cmd(event):
     global COMMANDS_USED_COUNT
@@ -543,6 +786,9 @@ async def saoff_cmd(event):
     await event.edit("⏸️ تم **إيقاف** التوسيع التلقائي للاختصارات.")
 
 
+# ==========================================
+# مجموعة اللايكات والجدولة
+# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/like(?:\s+(\d+))?$"))
 async def manual_like(event):
     global COMMANDS_USED_COUNT
@@ -625,6 +871,9 @@ async def sched_cmd(event):
         await event.edit(f"⏰ **حالة الجدولة اليومية (5:00 فجراً بتوقيت السعودية):** {state}")
 
 
+# ==========================================
+# مجموعة الرد التلقائي AFK
+# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"^/afk$"))
 async def toggle_afk(event):
     global AFK_ENABLED, COMMANDS_USED_COUNT
@@ -673,6 +922,9 @@ async def afk_count_cmd(event):
     await event.edit(f"💬 عدد الردود التلقائية المرسلة منذ التشغيل: `{AFK_REPLIES_COUNT}`")
 
 
+# ==========================================
+# مجموعة الرسائل والتحرير
+# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/say\s+(.+)$"))
 async def say_cmd(event):
     global COMMANDS_USED_COUNT
@@ -756,6 +1008,9 @@ async def copy_cmd(event):
     await event.edit(reply.raw_text)
 
 
+# ==========================================
+# مجموعة الملاحظات والأدوات والحالة والتسلية
+# ==========================================
 @user_client.on(events.NewMessage(outgoing=True, pattern=r"(?s)^/note\s+(.+)$"))
 async def add_note_cmd(event):
     global COMMANDS_USED_COUNT
@@ -856,12 +1111,10 @@ async def status_cmd(event):
     sa_state = "مفعل ✅" if SHORTCUTS_ENABLED else "متوقف ⏸️"
     ai_state = "مفعل ✅" if AI_ENABLED else "متوقف ⏸️"
     voice_state = "جاهز ✅" if VOICE_CALLS_AVAILABLE else "يحتاج ffmpeg/pytgcalls ⚠️"
-    file_state = "موجود ✅" if os.path.exists(LOCAL_AUDIO_FILE) else "غير مرفوع ⚠️"
     text = (
         "✅ **اليوزر بوت يعمل بكفاءة تامة**\n"
         f"⏱️ **مدة التشغيل:** `{format_uptime()}`\n"
-        f"🎵 **البث الصوتي:** {voice_state}\n"
-        f"📁 **ملف mahdi.m4a:** {file_state}\n"
+        f"📻 **البث الصوتي:** {voice_state} (نشط في `{len(ACTIVE_CALLS)}` قروب)\n"
         f"🤖 **الذكاء الاصطناعي:** {ai_state}\n"
         f"💬 **الرد التلقائي:** {afk_state}\n"
         f"⚡ **الاختصارات:** {sa_state}\n"
@@ -878,7 +1131,8 @@ async def stats_cmd(event):
         "📈 **إحصاءات الجلسة الحالية:**\n"
         f"• **مدة التشغيل:** `{format_uptime()}`\n"
         f"• **الأوامر المنفذة:** `{COMMANDS_USED_COUNT}`\n"
-        f"• **مقاطع الصوت المشغّلة:** `{VOICE_PLAYS_COUNT}`\n"
+        f"• **مرات البث المشغّلة:** `{VOICE_PLAYS_COUNT}`\n"
+        f"• **إعادة الاتصال التلقائي (24/7):** `{AUTO_RECONNECT_COUNT}`\n"
         f"• **طلبات /ai:** `{AI_REQUESTS_COUNT}`\n"
         f"• **الاختصارات المنفذة:** `{SHORTCUT_TRIGGERS_COUNT}`\n"
         f"• **عمليات اللايك المنفذة:** `{LIKE_RUNS_COUNT}`\n"
